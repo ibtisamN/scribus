@@ -32,6 +32,9 @@ for which a new license (GPL+exception) is in place.
 #include <QRegion>
 #include <cairo.h>
 #include <cassert>
+#include <hb.h>
+#include <hb-ft.h>
+#include <unicode/ubidi.h>
 
 #include "actionmanager.h"
 #include "appmodes.h"
@@ -1268,6 +1271,42 @@ void PageItem_TextFrame::adjustParagraphEndings ()
 	}
 }
 
+struct TextRun {
+	TextRun(int s, int l, UBiDiDirection d)
+		: start(s), len(l), dir(d)
+	{ }
+
+	int start;
+	int len;
+	UBiDiDirection dir;
+};
+
+static QList<TextRun> itemizeBiDi(QString text)
+{
+	QList<TextRun> textRuns;
+	UBiDi *obj = ubidi_open();
+	UErrorCode err = U_ZERO_ERROR;
+
+	ubidi_setPara(obj, text.utf16(), -1, UBIDI_LTR, NULL, &err); // FIXME
+	if (U_SUCCESS(err))
+	{
+		int32_t count = ubidi_countRuns(obj, &err);
+		if (U_SUCCESS(err))
+		{
+			textRuns.reserve(count);
+			for (int32_t i = 0; i < count; i++)
+			{
+				int32_t start, length;
+				UBiDiDirection dir = ubidi_getVisualRun(obj, i, &start, &length);
+				textRuns.append(TextRun(start, length, dir));
+			}
+		}
+	}
+
+	ubidi_close(obj);
+	return textRuns;
+}
+
 QList<GlyphRun> PageItem_TextFrame::shapeText()
 {
 	// maps expanded characters to itemText tokens.
@@ -1378,30 +1417,93 @@ QList<GlyphRun> PageItem_TextFrame::shapeText()
 		text.append(str);
 	}
 
+	QList<TextRun> textRuns = itemizeBiDi(text);
+
 	QList<GlyphRun> glyphRuns;
-	glyphRuns.reserve(text.length());
-	for (int i = 0; i < text.length(); i++)
-	{
-		const QChar ch(text.at(i));
-		int a = textMap.value(i);
+	CharStyle cs = itemText.charStyle(firstInFrame());
+	FT_Set_Char_Size(cs.font().ftFace(), cs.fontSize(), 0, 72, 0);
 
-		GlyphRun run(&itemText.charStyle(a), itemText.flags(a));
-		if (SpecialChars::isExpandingSpace(ch))
-			run.setFlag(ScLayout_ExpandingSpace);
-		run.setFirstChar(a);
-		run.setLastChar(a);
+	hb_font_t *hbFont = hb_ft_font_create_referenced(cs.font().ftFace());
+	hb_buffer_t *hbBuffer = hb_buffer_create();
 
-		GlyphLayout* layout = new GlyphLayout();
-		layoutGlyphs(run.style(), QString(ch), run.flags(), *layout);
-		run.glyphs().append(*layout);
+	foreach (TextRun textRun, textRuns) {
+		QVector<uint> ucs4 = text.toUcs4();
 
-		if (!run.glyphs().isEmpty())
+		hb_buffer_clear_contents(hbBuffer);
+		hb_buffer_add_utf32(hbBuffer, ucs4.data(), ucs4.length(), textRun.start, textRun.len);
+		hb_buffer_set_direction(hbBuffer, textRun.dir == UBIDI_LTR ? HB_DIRECTION_LTR : HB_DIRECTION_RTL);
+//		hb_buffer_set_script(hbBuffer, textRun.script);
+		hb_buffer_guess_segment_properties(hbBuffer);
+
+		hb_shape(hbFont, hbBuffer, NULL, 0);
+
+		unsigned int count = hb_buffer_get_length(hbBuffer);
+		hb_glyph_info_t *glyphs = hb_buffer_get_glyph_infos(hbBuffer, NULL);
+		hb_glyph_position_t *positions = hb_buffer_get_glyph_positions(hbBuffer, NULL);
+
+		glyphRuns.reserve(count);
+		for (size_t i = 0; i < count; i++)
 		{
-			GlyphLayout& last(run.glyphs().last());
-			last.xadvance += run.style().font().glyphKerning(last.glyph, layout->glyph, run.style().fontSize() / 10) * last.scaleH;
-		}
+			uint32_t firstCluster = glyphs[i].cluster;
+			uint32_t nextCluster = firstCluster;
+			for (size_t j = i + 1; j < count && nextCluster == firstCluster; j++)
+				nextCluster = glyphs[j].cluster;
+			if (nextCluster == firstCluster)
+				nextCluster = textRun.start + textRun.len;
 
-		glyphRuns.append(run);
+			assert(textMap.contains(firstCluster));
+			assert(textMap.contains(nextCluster - 1));
+			int firstChar = textMap.value(firstCluster);
+			int lastChar = textMap.value(nextCluster - 1);
+
+			QChar ch = itemText.text(firstChar);
+			LayoutFlags flags = itemText.flags(firstChar);
+			const CharStyle& charStyle(itemText.charStyle(firstChar));
+
+			GlyphRun run(&charStyle, flags);
+			if (SpecialChars::isExpandingSpace(ch))
+				run.setFlag(ScLayout_ExpandingSpace);
+
+			run.setFirstChar(firstChar);
+			run.setLastChar(lastChar);
+
+			GlyphLayout gl;
+			gl.glyph = glyphs[i].codepoint;
+			// indirect way to call ScFace::emulateGlyph() as it is private.
+			if (gl.glyph == 0)
+				gl.glyph = cs.font().char2CMap(ch);
+			gl.xoffset = positions[i].x_offset / 10.0;
+			gl.yoffset = positions[i].y_offset / 10.0;
+			gl.xadvance = positions[i].x_advance / 10.0;
+			gl.yadvance = positions[i].y_advance / 10.0;
+
+			double tracking = 0;
+			if (flags & ScLayout_StartOfLine)
+				tracking = charStyle.fontSize() * charStyle.tracking() / 10000.0;
+			gl.xoffset += tracking;
+
+			gl.scaleH = charStyle.scaleH() / 1000.0;
+			gl.scaleV = charStyle.scaleV() / 1000.0;
+
+			if (gl.yadvance <= 0)
+				gl.yadvance = charStyle.font().glyphBBox(gl.glyph, charStyle.fontSize() / 10).ascent * gl.scaleV;
+
+			gl.xadvance *= gl.scaleH;
+			gl.yadvance *= gl.scaleV;
+			if (gl.xadvance > 0)
+				gl.xadvance += tracking;
+
+			run.glyphs().append(gl);
+			glyphRuns.append(run);
+
+			//int effects = style.effects() & ScStyle_UserStyles;
+			// TODO: handle effects, see layoutGlyphs().
+
+			//            QString tc(text.at(c));
+			//            QString ic(ExpandToken(c));
+			//            qDebug() << "c: " << c << " " << tc << " " << ic << " " << bool(tc == ic);
+			//            qDebug() << "idx: " << glyph.index << "c: " << glyph.cluster << "xdv: " << glyph.x_advance;
+		}
 	}
 
 	return glyphRuns;
